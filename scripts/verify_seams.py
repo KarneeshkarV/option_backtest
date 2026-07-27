@@ -90,21 +90,30 @@ def check_strategy_seam(bars) -> bool:
 
 
 def check_vol_seam(bars) -> bool:
-    print("\n3. VOL MODEL -- swapping it changes premiums, never the schedule")
+    print("\n3. VOL MODEL -- swapping it changes premiums, never the timing")
     ok = report("registry", len(vol_model_names()) >= 2, f"{vol_model_names()}")
 
     gk = engine.run(bars, "orb", vol="gk_vrp")
     flat = engine.run(bars, "orb", vol="constant")
 
-    same_schedule = gk.trades[["entry_time", "exit_time"]].equals(
-        flat.trades[["entry_time", "exit_time"]]
-    )
+    # The signals come from spot, so a vol model can never move a trade to a
+    # different bar. It can, legitimately, remove bars it refuses to price at
+    # all: gk_vrp emits no IV until it is warm within a covered block, while
+    # `constant` is warm everywhere. So the honest invariant is not "identical
+    # schedules" but "gk_vrp's trades are a subset of `constant`'s, landing on
+    # exactly the same timestamps wherever both can price".
+    gk_schedule = gk.trades[["entry_time", "exit_time"]].reset_index(drop=True)
+    flat_schedule = flat.trades[["entry_time", "exit_time"]]
+    shared = flat_schedule[
+        flat_schedule["entry_time"].isin(gk_schedule["entry_time"])
+    ].reset_index(drop=True)
+    same_schedule = gk_schedule.equals(shared)
     ok = (
         report(
-            "trade schedule unchanged",
+            "trade timing unchanged where both models price",
             same_schedule,
-            f"{len(gk.trades):,} vs {len(flat.trades):,} trades, "
-            "same entry/exit timestamps",
+            f"{len(gk.trades):,} of {len(flat.trades):,} trades survive "
+            "gk_vrp's warmup, on identical entry/exit timestamps",
         )
         and ok
     )

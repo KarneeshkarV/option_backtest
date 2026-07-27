@@ -113,15 +113,30 @@ def sanity_checks(
     rather than continuing quietly.
     """
     rng = np.random.default_rng(seed)
-    take = min(sample_size, len(bars))
-    rows = np.sort(rng.choice(len(bars), size=take, replace=False))
+    atm_all = vol.atm_iv(bars).to_numpy()
+    # Bars before the vol model is warm carry no ATM level at all -- the model
+    # refuses to emit one until it has `seed_days` of history within the
+    # current covered block, rather than backfilling it from the future. Those
+    # bars are not part of the surface under test, and sampling them would fail
+    # every check below for the wrong reason. Excluded here and counted, so the
+    # exclusion is stated rather than silent.
+    warm = np.flatnonzero(np.isfinite(atm_all))
+    unwarmed = len(bars) - len(warm)
+    if len(warm) == 0:
+        return (
+            "SANITY CHECKS (synthetic surface)\n"
+            "  [FAIL] vol model never warms up            no bar has an ATM IV",
+            False,
+        )
+    take = min(sample_size, len(warm))
+    rows = np.sort(rng.choice(warm, size=take, replace=False))
     sample = bars.iloc[rows]
 
     spot = sample["close"].to_numpy()
     strike = atm_strike(spot)
     # Price a representative weekly: four sessions from expiry.
     tau = np.full_like(spot, 4.0 / 252.0)
-    atm = vol.atm_iv(bars).to_numpy()[rows]
+    atm = atm_all[rows]
     iv = vol.iv(atm, spot, strike, tau)
 
     call = black76.price(spot, strike, tau, iv, "call")
@@ -162,6 +177,11 @@ def sanity_checks(
     ]
 
     lines = ["SANITY CHECKS (synthetic surface)"]
+    if unwarmed:
+        lines.append(
+            f"  ({unwarmed:,} unwarmed bars excluded -- no IV until the model "
+            f"has seed_days of history in each covered block)"
+        )
     passed = True
     for name, ok, detail in checks:
         passed = passed and ok

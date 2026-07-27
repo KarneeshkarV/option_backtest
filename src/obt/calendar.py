@@ -4,11 +4,22 @@ Two things here quietly corrupt everything downstream if they are wrong, so
 both are explicit and both are tested:
 
 **The expiry weekday changed.** NIFTY weekly options expired on Thursday for
-most of this sample and moved to Tuesday from 2025-09-01. It is encoded as a
-dated rule table rather than a hardcoded weekday, so the switch is one line to
-correct and visible in review. *Verify this date against the NSE circular
-before trusting results that straddle it* -- a wrong switch date silently
-misprices a year of options rather than raising anything.
+most of this sample and moved to Tuesday. It is encoded as a dated rule table
+rather than a hardcoded weekday, so the switch is one line to correct and
+visible in review.
+
+The transition was announced in NSE/FAOP/68685 (2025-06-23), but that circular
+was superseded two days later by NSE/FAOP/68747 (2025-06-25) -- a "partial
+modification" using a different mechanism. 68685 alone would have this switch
+elongate the already-listed Thursday contracts forward to the following week's
+Tuesday; 68747 instead left existing Thursday contracts (through 2025-08-28)
+unchanged and had already pre-listed the new Tuesday contracts (02-Sep,
+09-Sep, ...) on the ordinary rolling schedule, so the real transition is a
+clean cutover, not an elongation. The effective boundary is 2025-08-29 (the
+first trading day the new Tuesday contracts govern), not 2025-09-01 -- verify
+*both* circular numbers, not just the first, before trusting results that
+straddle this date; a wrong switch date silently misprices options rather
+than raising anything.
 
 **Holidays come from the data, not a hardcoded list.** The set of trading days
 is whatever the loaded bars contain. If a nominal expiry has no session, expiry
@@ -19,6 +30,12 @@ dataset instead of inventing expiries inside them.
 Time to expiry is measured in **trading time** (bars remaining / 375 / 252),
 not calendar time. Calendar time badly overstates overnight theta for weekly
 options -- a Friday-to-Monday hold is one trading day of decay, not three.
+
+**Pricing and fills happen at each bar's close** (see ``chain.pinned_leg`` and
+the premium frame in ``engine.py``), so bar ``i``'s minute has already elapsed
+by the time it is priced. Time remaining today counts only bars strictly
+after the current one, which makes tau exactly zero on the expiry session's
+final bar rather than one bar short of it.
 """
 
 from __future__ import annotations
@@ -32,10 +49,15 @@ import pandas as pd
 from obt.session import BARS_PER_SESSION, TRADING_DAYS_PER_YEAR, stamps
 
 #: ``(effective_from, weekday)`` with Monday=0. Most recent applicable wins.
-#: Thursday=3 historically; Tuesday=1 from 2025-09-01.
+#: Thursday=3 historically; Tuesday=1 from 2025-08-29 -- the first trade date
+#: governed by the new-regime contracts per NSE/FAOP/68747 (2025-06-25),
+#: which superseded NSE/FAOP/68685 (2025-06-23). NOT 2025-09-01: that date is
+#: three calendar days (one trading day) too late, and NOT 2025-08-28, which
+#: would wrongly flip 2025-08-28's own resolution (it is the last date the
+#: old Thursday regime governs, per the circular).
 WEEKLY_EXPIRY_RULES: tuple[tuple[date, int], ...] = (
     (date(1900, 1, 1), 3),
-    (date(2025, 9, 1), 1),
+    (date(2025, 8, 29), 1),
 )
 
 
@@ -120,9 +142,14 @@ def tau_years(
 ) -> np.ndarray:
     """Trading-time years to expiry for every bar.
 
-    On the expiry day's final bar this approaches one bar of time rather than
-    zero, so pricing degrades smoothly into intrinsic value instead of
-    discontinuously.
+    Pricing and fills use each bar's CLOSE (``chain.pinned_leg``, the premium
+    frame vectorbt trades in ``engine.py``), so by the time bar ``i`` is priced
+    that bar's minute is already gone. Time remaining today therefore counts
+    only bars strictly after the current one -- on the expiry session's final
+    bar there are none left, so tau is exactly zero and Black-76 (see
+    ``pricing.black76.price``, which returns intrinsic value for
+    ``tau <= _MIN_TAU``) prices it as pure intrinsic rather than decaying into
+    it a bar late.
 
     Set ``calendar_time=True`` to use wall-clock days/365 instead -- available
     for comparison, but it overstates decay for anything held overnight.
@@ -139,7 +166,7 @@ def tau_years(
             ],
             dtype="float64",
         )
-        remaining_today = (BARS_PER_SESSION - bar_of_day) / BARS_PER_SESSION
+        remaining_today = (BARS_PER_SESSION - 1 - bar_of_day) / BARS_PER_SESSION
         return np.maximum((days + remaining_today) / 365.0, 0.0)
 
     # Trading time: whole sessions strictly after today, plus today's remainder.
@@ -151,7 +178,7 @@ def tau_years(
         dtype="float64",
     )
     full_sessions_ahead = sessions - 1.0
-    remaining_today = (BARS_PER_SESSION - bar_of_day) / BARS_PER_SESSION
+    remaining_today = (BARS_PER_SESSION - 1 - bar_of_day) / BARS_PER_SESSION
     total_sessions = full_sessions_ahead + remaining_today
     return np.maximum(total_sessions / TRADING_DAYS_PER_YEAR, 0.0)
 

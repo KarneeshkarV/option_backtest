@@ -20,9 +20,9 @@ over the assumptions that drive the result.
 **What is real:** the spot path. Every P&L number traces to a NIFTY print that
 actually happened. The missing months stay missing — nothing is simulated.
 
-**What is measured:** the volatility *level*. `vrp_mult = 1.31` was fitted to 60
-sessions of real observed NIFTY ATM quotes, not guessed. See
-[Calibration](#calibration).
+**What is measured:** the volatility *level*. `vrp_mult = 1.24` was fitted to
+real observed NIFTY ATM quotes, not guessed — though to about one decimal
+place, not three. See [Calibration](#calibration).
 
 **What is still assumed:** skew, the term structure, and the absence of a
 margin model. Named individually below so none of them can hide.
@@ -121,16 +121,31 @@ When a real option chain arrives, `pinned_leg` is the one function to replace.
 same expiry, same right — and compares to what they actually traded at:
 
 ```
-vrp_mult = 1.312 (median implied IV 14.1% / realized vol 10.8%, 7,108 near-ATM bars)
+vrp_mult = 1.244  [95% CI 1.201-1.260]
+  estimator  : median of per-session medians (one vote per day)
+  sample     : 23 sessions / 13 weekly expiries -- NOT 7,100 independent bars
+  reweighted : bar-weighted 1.226, per-expiry 1.257
+  by right   : call 1.182, put 1.252
+  by tau     : 2d 1.331, 3d 1.237, 4d 1.198, 5d 1.221
+  in/out     : 1.254 on the first 14 sessions vs 1.199 on 9 held-out later sessions
 
-  call : median  +0.68% | MAE Rs 12.8 | corr 0.9908
-  put  : median  -4.66% | MAE Rs 13.6 | corr 0.9876
+  call : median  +1.36% | MAE Rs 13.1 | corr 0.9909
+  put  : median  -3.33% | MAE Rs 12.9 | corr 0.9882
 ```
 
-This moved `vrp_mult` from a textbook 1.15 to a measured 1.31 — the original
-under-priced real calls by about 7%, and the correction worsened the reference
-strategy's return by 11 percentage points. That sensitivity is the point:
-`vrp_mult` alone decides whether premium-selling looks profitable.
+This moved `vrp_mult` from a textbook 1.15 to a measured 1.24. `vrp_mult` alone
+decides whether premium-selling looks profitable, so the honest reading of that
+number matters more than the number: **the retained rows are minutes, not
+observations.** They come from 23 sessions across 13 weekly expiries, share one
+realized-vol denominator per day, and autocorrelate heavily within a session —
+so the fit clusters at the session level and reports a session-bootstrap band.
+The reweightings disagree by more than that band is wide, and the held-out
+cycles drift to 1.199. Read it as "about 1.2, one regime, three months".
+
+An earlier fit of 1.31 was measured while the vol model smoothed volatility
+instead of variance, which understated realized vol by about 7%; the multiplier
+had silently absorbed that bias, so correcting the estimator required
+re-fitting it down rather than keeping both corrections.
 
 **Skew is not calibrated and cannot be from this data.** The files carry one
 strike per weekly cycle, so the moneyness spread comes from spot drifting away

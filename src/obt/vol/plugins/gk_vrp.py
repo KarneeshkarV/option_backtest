@@ -23,9 +23,9 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from obt.session import TRADING_DAYS_PER_YEAR
+from obt.session import TRADING_DAYS_PER_YEAR, covered_periods
 from obt.vol.spec import vol_model
 
 #: Garman-Klass constant on the close-to-open term.
@@ -35,15 +35,31 @@ _GK_C = 2.0 * np.log(2.0) - 1.0
 class VolParams(BaseModel):
     """Every knob the vol model exposes. Frozen so a run cannot mutate it."""
 
-    vrp_mult: float = Field(default=1.31, gt=0)
+    vrp_mult: float = Field(default=1.24, gt=0)
     """IV = realized vol x this. The dominant assumption; sweep it anyway.
 
-    **Measured, not guessed.** :func:`obt.calibration.fit_vol_params` inverts
-    60 sessions of observed NIFTY ATM quotes to implied vol and divides by this
-    model's own realized-vol input; the median over 7,108 near-ATM bars is 1.31.
-    The original 1.15 was a textbook figure and it under-priced real calls by
-    about 7%. Three months is a thin sample and one volatility regime, so treat
-    1.31 as a better-anchored estimate rather than a settled constant.
+    **Measured, not guessed -- but far less precisely than it looks.**
+    :func:`obt.calibration.fit_vol_params` inverts observed NIFTY ATM quotes to
+    implied vol and divides by this model's own realized-vol input. The
+    estimator is a median of *per-session* medians -- one vote per trading day
+    -- because the retained rows are one-minute quotes that share a single
+    daily realized-vol denominator and autocorrelate heavily within a session.
+    They are not independent draws, and the older bar-level median presented
+    7,108 of them as if they were.
+
+    The honest sample is **23 sessions across 13 weekly expiries**, giving
+    1.244 with a session-bootstrap 95% band of roughly 1.20-1.26. Reweightings
+    disagree by more than that band is wide: bar-weighted 1.226, per-expiry
+    1.257, calls 1.18 vs puts 1.25, and 1.33 at two sessions to expiry against
+    1.20 at four. Held-out later cycles give 1.199 against 1.254 on the earlier
+    ones, so the level drifts with regime. **Read this as "about 1.2, one
+    regime, three months", not as three significant figures.**
+
+    Previously 1.31, fitted before :func:`_garman_klass_daily_variance` existed:
+    the EWMA then smoothed vol instead of variance and understated realized vol
+    by about 7%, so the multiplier had silently absorbed that bias. Correcting
+    the estimator raised realized vol and the multiplier had to come down with
+    it, or the same correction would have been counted twice.
     """
 
     skew_beta: float = Field(default=-1.2)
@@ -66,18 +82,35 @@ class VolParams(BaseModel):
     """Clamps, so a quiet stretch cannot produce near-zero premiums."""
 
     seed_days: int = Field(default=10, ge=1)
-    """Days used to seed the EWMA before the series is considered warm."""
+    """Sessions of prior history required before a bar is considered warm.
+
+    A bar in a session short of ``seed_days`` predecessors (counting from the
+    start of its covered data block -- see :func:`obt.session.covered_periods`)
+    gets a NaN ATM IV rather than a level derived from too little history.
+    """
 
     model_config = ConfigDict(frozen=True)
 
+    @model_validator(mode="after")
+    def _check_clamp_bounds(self) -> VolParams:
+        if self.iv_cap < self.iv_floor:
+            raise ValueError(
+                f"iv_cap ({self.iv_cap}) must be >= iv_floor ({self.iv_floor}); "
+                "a reversed clamp silently flattens the whole IV surface to "
+                "iv_cap."
+            )
+        return self
 
-def garman_klass_daily(bars: pd.DataFrame) -> pd.Series:
-    """Per-day annualized realized vol from intraday OHLC.
 
-    Each day is reduced to its session open, high, low and close, then fed
-    through the Garman-Klass estimator. Aggregating within the day first is
-    what keeps overnight gaps -- and the multi-month data holes -- out of the
-    estimate entirely.
+def _garman_klass_daily_variance(bars: pd.DataFrame) -> pd.Series:
+    """Per-day (non-annualized) realized variance from intraday OHLC.
+
+    Split out from :func:`garman_klass_daily` so smoothing can happen in
+    variance units. An EWMA average belongs over the variance, not over its
+    square root: sqrt is concave, so averaging already-annualized vols (as the
+    original code did) computes ``E[sqrt(V)]``, which sits systematically
+    below the correct ``sqrt(E[V])`` (Jensen's inequality) and damps regime
+    changes.
     """
     grouped = bars.groupby(bars["date"])
     daily = pd.DataFrame(
@@ -92,8 +125,36 @@ def garman_klass_daily(bars: pd.DataFrame) -> pd.Series:
     log_co = np.log(daily["close"] / daily["open"])
     variance = 0.5 * log_hl**2 - _GK_C * log_co**2
     # GK can go slightly negative on a doji-ish day; clip rather than NaN out.
-    variance = variance.clip(lower=0.0)
+    return variance.clip(lower=0.0)
+
+
+def _annualize_vol(variance: pd.Series) -> pd.Series:
+    """sqrt(variance * trading days), factored out so the type stays ``Series``.
+
+    ``np.sqrt`` on a bare expression loses the static ``Series`` type to mypy
+    (it resolves to an ndarray overload), which then breaks the pandas-style
+    ``.clip(lower=..., upper=...)`` call downstream. Routing through a
+    function with an explicit ``-> pd.Series`` return annotation is the same
+    trick :func:`garman_klass_daily` already relied on.
+    """
     return np.sqrt(variance * TRADING_DAYS_PER_YEAR)
+
+
+def garman_klass_daily(bars: pd.DataFrame) -> pd.Series:
+    """Per-day annualized realized vol from intraday OHLC.
+
+    Each day is reduced to its session open, high, low and close, then fed
+    through the Garman-Klass estimator. Aggregating within the day first is
+    what keeps overnight gaps -- and the multi-month data holes -- out of the
+    estimate entirely.
+
+    Public contract preserved: this still returns annualized VOL (sqrt of
+    variance), same as before. :meth:`GkVrpVolModel.atm_iv` no longer calls
+    this directly -- it smooths :func:`_garman_klass_daily_variance` instead,
+    in variance units, and only takes the square root once at the end.
+    """
+    variance = _garman_klass_daily_variance(bars)
+    return _annualize_vol(variance)
 
 
 class GkVrpVolModel:
@@ -111,13 +172,34 @@ class GkVrpVolModel:
 
     def atm_iv(self, bars: pd.DataFrame) -> pd.Series:
         p = self.params
-        daily_rv = garman_klass_daily(bars)
-        smoothed = daily_rv.ewm(halflife=p.halflife_days, min_periods=1).mean()
-        # Shift one day: bars on day D are priced with information through D-1.
-        smoothed = smoothed.shift(1)
-        # Seed the first day (and any leading NaN) with the first real estimate.
-        smoothed = smoothed.bfill()
-        atm = (smoothed * p.vrp_mult).clip(lower=p.iv_floor, upper=p.iv_cap)
+        daily_variance = _garman_klass_daily_variance(bars)
+
+        # EWMA per covered block, not across the whole series: a 300-day hole
+        # is not "yesterday" and must not hand its pre-gap smoothed level to
+        # the first session after the hole. `covered_periods` gives the block
+        # boundaries; each block's EWMA starts cold.
+        blocks: list[pd.Series] = []
+        for start, end in covered_periods(bars):
+            block = daily_variance.loc[
+                (daily_variance.index >= start) & (daily_variance.index <= end)
+            ]
+            # min_periods=seed_days actually honours seed_days: a bar needs
+            # that many prior sessions of history before it is "warm".
+            smoothed = block.ewm(
+                halflife=p.halflife_days, min_periods=p.seed_days
+            ).mean()
+            # Shift one day: bars on day D are priced with variance smoothed
+            # through D-1 only. No bfill -- a leading NaN (the block's first
+            # `seed_days` sessions have no D-1 within the block) stays NaN
+            # rather than being seeded from that session's own full-day GK
+            # estimate, which would be a lookahead leak on day one.
+            blocks.append(smoothed.shift(1))
+        smoothed_variance = (
+            pd.concat(blocks) if blocks else daily_variance.iloc[0:0].astype("float64")
+        )
+
+        smoothed_vol = _annualize_vol(smoothed_variance)
+        atm = (smoothed_vol * p.vrp_mult).clip(lower=p.iv_floor, upper=p.iv_cap)
         return bars["date"].map(atm).astype("float64")
 
     def iv(

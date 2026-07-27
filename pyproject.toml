@@ -41,6 +41,10 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 88
+# `reports/` holds analysis write-ups, not source. Their fenced snippets are
+# quoted evidence (circular text, before/after diffs) and must stay verbatim,
+# so the Python formatter does not get to rewrite them.
+extend-exclude = ["reports"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

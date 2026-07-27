@@ -31,7 +31,7 @@ from obt.calendar import ExpiryCalendar, block_edge_sessions
 from obt.chain import LegSpec, lot_size_for, pinned_leg
 from obt.costs import IndiaOptionsCosts, SlippageParams, vbt_fees
 from obt.session import TRADING_DAYS_PER_YEAR
-from obt.signals import last_bar_of_day, resolve_trades, shift_signals
+from obt.signals import last_bar_of_day, resolve_trades, shift_legs, shift_signals
 from obt.strategies.spec import get_strategy
 from obt.vol.base import VolModel
 from obt.vol.spec import get_vol_model
@@ -174,12 +174,26 @@ def run(
     merged = {**spec.defaults, **(params or {})}
     signals = spec.signal_fn(bars, **merged)
 
-    # Guarantee 1: act on the next bar, not the signalling one. The per-bar leg
-    # choice must shift with the entries it belongs to, or the leg lookup below
-    # misses every open.
-    entries = shift_signals(signals.entries)
-    exits = shift_signals(signals.exits)
-    shifted_legs = signals.legs.shift(1) if signals.legs is not None else None
+    # Guarantee 1: act on the next bar, not the signalling one. The shift never
+    # carries a signal across a session boundary -- see obt.signals -- so
+    # stale intent from one session cannot resolve into an open on a later
+    # one, however far away, across one of this dataset's gaps. The per-bar
+    # leg choice must shift with the entries it belongs to, or the leg lookup
+    # below misses every open.
+    entries = shift_signals(signals.entries, bars["date"])
+    exits = shift_signals(signals.exits, bars["date"])
+    shifted_legs = (
+        shift_legs(signals.legs, bars["date"]) if signals.legs is not None else None
+    )
+
+    # The vol model emits no IV until it is warm -- it requires `seed_days` of
+    # history within the current covered block rather than backfilling from the
+    # future. An option priced off a NaN IV is not a tradeable bar, so entry
+    # intent is dropped there. Without this, vectorbt silently ignores the
+    # resulting NaN-priced orders and the shortfall resurfaces below as a bogus
+    # "cash ran out" censoring warning, which is a misdiagnosis.
+    warm = np.isfinite(vol_model.atm_iv(bars).to_numpy())
+    entries = entries & warm
 
     # Guarantee 2 + 3: resolve to real positions with a forced end-of-day exit.
     is_last = last_bar_of_day(bars)
@@ -197,7 +211,8 @@ def run(
     entry_columns: dict[str, np.ndarray] = {}
     exit_columns: dict[str, np.ndarray] = {}
     leg_frames: dict[str, pd.DataFrame] = {}
-    is_short = False
+    column_legs: list[LegSpec] = []
+    used_names: dict[str, int] = {}
 
     for leg, leg_open in groups:
         priced = pinned_leg(
@@ -205,28 +220,51 @@ def run(
         )
         # Close only the trades this leg actually opened.
         leg_close = close_mask & _closes_for_opens(leg_open, open_mask, close_mask)
+        # `leg.label` collides whenever two distinct LegSpecs describe the same
+        # column name (e.g. same right/direction/strike_rule but different lot
+        # counts) -- disambiguate rather than silently let the second group's
+        # entries/exits overwrite the first's in these dicts.
         name = leg.label
+        used_names[name] = used_names.get(name, 0) + 1
+        if used_names[name] > 1:
+            name = f"{name} #{used_names[name]}"
         premium_columns[name] = priced["premium"]
         entry_columns[name] = leg_open
         exit_columns[name] = leg_close
         leg_frames[name] = priced
-        is_short = is_short or leg.direction == "short"
+        column_legs.append(leg)
 
     close = pd.DataFrame(premium_columns, index=bars.index)
     entry_df = pd.DataFrame(entry_columns, index=bars.index)
     exit_df = pd.DataFrame(exit_columns, index=bars.index)
 
-    reference_leg = groups[0][0]
-    effective_lot = lot_size if lot_from_history else reference_leg.lot_size
-    quantity = reference_leg.lots * effective_lot
+    # Direction and size are resolved PER COLUMN, never collapsed to a
+    # portfolio-wide scalar: a strategy long calls on some days and short puts
+    # on others must not have one leg's direction or size bleed into the
+    # other's. Empirically verified against the installed vectorbt (1.0.0):
+    # `from_signals`'s `direction` and `size` accept a plain Python list
+    # broadcast positionally against `close`'s columns (this is the pattern
+    # vectorbt's own docstring uses, e.g. `direction = ['longonly',
+    # 'shortonly']`). A `pd.Series` keyed by column name does NOT broadcast
+    # the same way -- it raises a shape-mismatch error -- so these must stay
+    # plain lists in `close.columns` order, which is exactly the order
+    # `column_legs` was built in above.
+    is_short = any(leg.direction == "short" for leg in column_legs)
+    quantities = [
+        leg.lots * (lot_size if lot_from_history else leg.lot_size)
+        for leg in column_legs
+    ]
+    directions = [
+        "shortonly" if leg.direction == "short" else "longonly" for leg in column_legs
+    ]
 
     portfolio = vbt.Portfolio.from_signals(
         close,
         entry_df,
         exit_df,
-        size=float(quantity),
+        size=[float(q) for q in quantities],
         size_type="amount",
-        direction="shortonly" if is_short else "longonly",
+        direction=directions,
         init_cash=float(init_cash),
         fees=vbt_fees(costs),
         slippage=float(slippage.premium_pct),
@@ -241,6 +279,14 @@ def run(
         "Premiums are Black-76 model output, not observed quotes. "
         "Every P&L number inherits the vol model's assumptions."
     ]
+
+    unwarmed_sessions = int(bars.loc[~warm, "date"].nunique())
+    if unwarmed_sessions:
+        warnings.append(
+            f"{unwarmed_sessions} of {bars['date'].nunique()} sessions carry no "
+            "vol-model IV yet -- the model re-warms after every data gap -- and "
+            "were excluded from trading rather than priced off a backfilled IV."
+        )
 
     # A losing run can spend the account partway through the sample, after
     # which vectorbt rejects orders for want of cash. The backtest still
@@ -273,9 +319,15 @@ def run(
             )
 
     if not lot_from_history:
+        # Report the flat lot size(s) actually used per leg (usually one
+        # shared value, but heterogeneous legs may assume different flats).
+        distinct_lots = sorted({leg.lot_size for leg in column_legs})
+        lot_desc = (
+            str(distinct_lots[0]) if len(distinct_lots) == 1 else str(distinct_lots)
+        )
         warnings.append(
             f"No point-in-time lot history found; assumed a flat lot size of "
-            f"{quantity // max(groups[0][0].lots, 1)}. NIFTY's lot size changed "
+            f"{lot_desc}. NIFTY's lot size changed "
             "during this sample, so early-period notionals are approximate."
         )
     if is_short:
@@ -283,6 +335,17 @@ def run(
             "Short legs present: vectorbt models no SPAN/ELM margin, so "
             "return-on-capital is optimistic."
         )
+
+    # A single scalar quantity is only meaningful when every leg trades the
+    # same amount, which is the only case the pre-fix engine ever produced
+    # correctly (and is bit-identical to it here). Heterogeneous per-leg sizes
+    # -- newly correct, not previously reachable -- are reported per column
+    # instead of forcing a misleading single number.
+    quantity_per_trade: int | dict[str, int] = (
+        quantities[0]
+        if len(set(quantities)) == 1
+        else dict(zip(close.columns, quantities, strict=True))
+    )
 
     assumptions = {
         "strategy": strategy_name,
@@ -293,7 +356,7 @@ def run(
         "stt_rate": costs.stt_rate,
         "init_cash": init_cash,
         "lot_from_history": lot_from_history,
-        "quantity_per_trade": quantity,
+        "quantity_per_trade": quantity_per_trade,
         "time_basis": "calendar" if calendar_time else "trading",
     }
 

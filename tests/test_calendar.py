@@ -31,10 +31,31 @@ def calendar() -> ExpiryCalendar:
 
 
 def test_expiry_weekday_switches_to_tuesday():
-    assert expiry_weekday(date(2024, 6, 1)) == 3  # Thursday
-    assert expiry_weekday(date(2025, 8, 31)) == 3
-    assert expiry_weekday(date(2025, 9, 1)) == 1  # Tuesday
-    assert expiry_weekday(date(2026, 1, 5)) == 1
+    """Boundary per NSE/FAOP/68747 (2025-06-25), amending NSE/FAOP/68685
+    (2025-06-23): existing Thursday contracts through 2025-08-28 are
+    unaffected; the new Tuesday contracts govern from 2025-08-29, the first
+    trade date after the old regime's last contract (2025-08-28) is settled.
+    """
+    assert expiry_weekday(date(2024, 6, 1)) == 3  # Thursday, deep in old regime
+    assert expiry_weekday(date(2025, 8, 28)) == 3  # last old-regime trade date
+    assert expiry_weekday(date(2025, 8, 29)) == 1  # first new-regime trade date
+    assert expiry_weekday(date(2026, 1, 5)) == 1  # Tuesday, deep in new regime
+
+
+def test_weekly_expiry_on_transition_day_is_september_2(calendar):
+    """Pins the actual transition-week fact this whole rule exists for.
+
+    NSE/FAOP/68685 (2025-06-23) alone would read as elongating the existing
+    Thursday contracts forward (implying front weekly 2025-09-09 on the
+    transition day); NSE/FAOP/68747 (2025-06-25), a "partial modification" of
+    68685, instead left existing Thursday contracts through 2025-08-28
+    unchanged and had already pre-listed the new Tuesday contracts (02-Sep,
+    09-Sep, ...) on the ordinary rolling schedule -- a clean cutover, not an
+    elongation. 2025-08-29 was independently confirmed (same-day reporting)
+    as the first trade date resolving to the new 2025-09-02 Tuesday contract.
+    """
+    assert calendar.weekly_expiry_for(date(2025, 8, 28)) == date(2025, 8, 28)
+    assert calendar.weekly_expiry_for(date(2025, 8, 29)) == date(2025, 9, 2)
 
 
 def test_weekly_expiry_before_switch_is_thursday(calendar):
@@ -105,15 +126,53 @@ def test_tau_uses_trading_time_not_calendar_time(bars):
     assert np.any(np.isclose(np.abs(steps), one_session, atol=1e-9))
 
 
-def test_tau_at_final_bar_is_one_bar_not_zero(bars):
-    calendar = ExpiryCalendar.from_bars(bars)
+def test_tau_at_expiry_close_is_exactly_zero_not_one_bar(two_week_bars):
+    """Pricing and fills happen at each bar's close (see the module docstring
+    and ``chain.pinned_leg``), so the expiry session's final bar has already
+    elapsed by the time it is priced -- zero bars of time remain, not one.
+    The first bar of that same session still has 374 of its 375 bars ahead.
+    """
+    calendar = ExpiryCalendar.from_bars(two_week_bars)
     from obt.calendar import expiry_series
 
-    expiry = expiry_series(bars, calendar)
-    tau = tau_years(bars, expiry, calendar)
-    # Last bar of an expiry day: one bar of trading time remains.
-    smallest = tau.min()
-    assert 0 < smallest <= (1.0 / BARS_PER_SESSION) / 252.0 + 1e-12
+    expiry = expiry_series(two_week_bars, calendar)
+    tau = tau_years(two_week_bars, expiry, calendar)
+
+    expiry_day = date(2024, 1, 4)  # a genuine Thursday expiry inside the data
+    on_expiry = (two_week_bars["date"] == expiry_day).to_numpy()
+    bar_of_day = two_week_bars.loc[on_expiry, "bar_of_day"].to_numpy()
+    day_tau = tau[on_expiry]
+
+    assert day_tau[bar_of_day == BARS_PER_SESSION - 1][0] == 0.0
+    assert day_tau[bar_of_day == 0][0] == pytest.approx(374.0 / 375.0 / 252.0)
+
+
+def test_black76_prices_expiry_close_as_intrinsic_not_a_stale_bar(two_week_bars):
+    """Regression for the off-by-one: at ATM, the stale tau priced a phantom
+    Rs 5.20 of time value into the forced expiry-day exit instead of Rs 0.
+    """
+    from obt.pricing.black76 import price
+
+    calendar = ExpiryCalendar.from_bars(two_week_bars)
+    from obt.calendar import expiry_series
+
+    expiry = expiry_series(two_week_bars, calendar)
+    tau = tau_years(two_week_bars, expiry, calendar)
+
+    expiry_day = date(2024, 1, 4)
+    on_expiry = (two_week_bars["date"] == expiry_day).to_numpy()
+    bar_of_day = two_week_bars.loc[on_expiry, "bar_of_day"].to_numpy()
+    final_tau = tau[on_expiry][bar_of_day == BARS_PER_SESSION - 1][0]
+
+    spot = strike = 20_000.0
+    premium = price(
+        np.array([spot]),
+        np.array([strike]),
+        np.array([final_tau]),
+        np.array([0.20]),
+        "call",
+    )
+    assert premium[0] == 0.0
 
 
 def test_block_edge_sessions_flags_the_data_boundary(bars):

@@ -1,0 +1,22 @@
+warning: `VIRTUAL_ENV=/root/screneer_main/screener/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+VOL MODEL CALIBRATION
+  model    : gk_vrp(vrp=1.31, skew=-1.2, hl=10d)
+  spot     : 2021-06-18 -> 2026-07-21
+
+vrp_mult = 1.312 (median implied IV 14.1% / realized vol 10.8%, 7,108 near-ATM bars of 26,422 solvable)
+skew_beta = not identifiable from this data (one strike per weekly cycle); the configured value stands unvalidated.
+
+RESIDUAL PRICING ERROR (41,636 observed bars)
+  call : median  +0.68% | MAE Rs  12.8 | corr 0.9908
+  put  : median  -4.66% | MAE Rs  13.6 | corr 0.9876
+
+MEDIAN RELATIVE ERROR BY TRADING DAYS TO EXPIRY
+tau     0.0   1.0   2.0   3.0   4.0    5.0
+right                                     
+call  +0.1% +1.6% -0.3% +0.0% +2.3%  +1.8%
+put   -0.4% +0.3% -6.6% -7.0% -6.9% -10.0%
+
+Reminder: only the ATM *level* is identified here. One strike per
+weekly cycle cannot measure skew, so the put column carries an
+unvalidated `skew_beta` and should not be read as a model error.
+exit=0

@@ -63,10 +63,93 @@ def test_covered_periods_splits_on_a_real_gap():
 
 
 def test_shift_signals_delays_by_one_bar():
+    """Within a single session, the shift is the ordinary one-bar delay."""
     mask = np.array([False, True, False, False])
+    dates = np.array([date(2024, 1, 1)] * 4)
     np.testing.assert_array_equal(
-        shift_signals(mask), np.array([False, False, True, False])
+        shift_signals(mask, dates), np.array([False, False, True, False])
     )
+
+
+def test_shift_signals_drops_stale_intent_across_a_gap():
+    """The core finding-6 case: two complete sessions 270 days apart, with an
+    entry signal only on the first session's last bar. A purely positional
+    shift would carry that stale intent 270 days forward into an entry on the
+    far session's first bar -- resolving into a causally-invalid open that
+    happens to close normally the same day, so ordinary gap assertions would
+    not catch it. The session-boundary-aware shift must drop it instead.
+    """
+    frames = []
+    for offset in (0, 270):
+        day = date(2024, 1, 1) + timedelta(days=offset)
+        index = pd.date_range(
+            datetime(day.year, day.month, day.day, 9, 15),
+            periods=BARS_PER_SESSION,
+            freq="1min",
+            tz=IST,
+        )
+        frames.append(
+            pd.DataFrame(
+                {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0},
+                index=index,
+            )
+        )
+    bars = session.add_session_cols(pd.concat(frames))
+
+    raw_entries = last_bar_of_day(bars)  # signal only on each session's last bar
+    entries = shift_signals(raw_entries, bars["date"])
+
+    far_session = bars["date"].to_numpy() == (date(2024, 1, 1) + timedelta(days=270))
+    assert not entries[far_session][0], (
+        "stale intent from the first session must not open a position on the "
+        "far session, 270 days later"
+    )
+    # The near session's last-bar signal is simply dropped too -- there is no
+    # bar left within that session to act on it -- rather than silently
+    # resolving into a delayed entry.
+    assert not entries.any()
+
+
+def test_shift_legs_is_boundary_aware_like_shift_signals():
+    """The per-bar leg series must not carry a leg choice across a session
+    boundary either, or a resolved open on the far session would look up a
+    stale leg that belonged to a position from months earlier.
+    """
+    from obt.chain import LegSpec
+    from obt.signals import shift_legs
+
+    frames = []
+    for offset in (0, 270):
+        day = date(2024, 1, 1) + timedelta(days=offset)
+        index = pd.date_range(
+            datetime(day.year, day.month, day.day, 9, 15),
+            periods=BARS_PER_SESSION,
+            freq="1min",
+            tz=IST,
+        )
+        frames.append(
+            pd.DataFrame(
+                {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0},
+                index=index,
+            )
+        )
+    bars = session.add_session_cols(pd.concat(frames))
+
+    leg = LegSpec(right="call", direction="long", strike_rule="atm")
+    is_last = last_bar_of_day(bars)
+    legs = pd.Series([leg if last else None for last in is_last], index=bars.index)
+
+    shifted = shift_legs(legs, bars["date"])
+    far_session = bars["date"].to_numpy() == (date(2024, 1, 1) + timedelta(days=270))
+    assert shifted[far_session].iloc[0] is None
+
+    # Within a session, an ordinary one-bar carry still works: put a leg one
+    # bar before the (dropped) last-bar signal and confirm it shifts by one.
+    legs_within = pd.Series([None] * len(bars), index=bars.index, dtype=object)
+    legs_within.iloc[5] = leg
+    shifted_within = shift_legs(legs_within, bars["date"])
+    assert shifted_within.iloc[6] is leg
+    assert shifted_within.iloc[5] is None
 
 
 def test_last_bar_of_day_marks_each_session_end(bars):

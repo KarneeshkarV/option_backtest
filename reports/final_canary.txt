@@ -1,0 +1,50 @@
+warning: `VIRTUAL_ENV=/root/screneer_main/screener/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+==============================================================================
+SYNTHETIC OPTION BACKTEST -- premiums are modelled, not observed
+==============================================================================
+strategy       : buy_open  {'entry_bar': 5}
+vol model      : gk_vrp(vrp=1.24, skew=-1.2, hl=10d)
+calibration    : vrp_mult fitted to 60 sessions of observed NIFTY ATM quotes (run `just calibrate`); skew unvalidated
+slippage       : 0.750% of premium per fill
+statutory fees : 0.2303% per fill (STT 0.1000% sell-side)
+time basis     : trading time to expiry
+size           : 75 units/trade (lot from history: False)
+capital        : Rs 2,000,000
+
+sample         : 328,875 bars over 877 trading days, in 8 blocks
+                 2021-06-18 -> 2021-12-13
+                 2022-10-10 -> 2022-11-07
+                 2022-12-09 -> 2023-03-08
+                 2023-04-10 -> 2024-04-30
+                 2024-05-31 -> 2024-10-28
+                 2024-12-27 -> 2025-05-26
+                 2025-06-27 -> 2025-09-23
+                 2025-10-23 -> 2026-06-12
+
+  ! Premiums are Black-76 model output, not observed quotes. Every P&L number inherits the vol model's assumptions.
+  ! 80 of 877 sessions carry no vol-model IV yet -- the model re-warms after every data gap -- and were excluded from trading rather than priced off a backfilled IV.
+  ! 17 of 797 trades sit on the trailing edge of a data block (17 such sessions), where the expiry rolls back only because the data stops rather than because the exchange was shut. Their options are priced too cheap by a shortened time to expiry.
+  ! No point-in-time lot history found; assumed a flat lot size of 75. NIFTY's lot size changed during this sample, so early-period notionals are approximate.
+
+DATA
+  bars  : 331,097 read -> 328,875 kept
+  days  : 891 read -> 877 kept (14 incomplete sessions dropped)
+
+SANITY CHECKS (synthetic surface)
+  (30,000 unwarmed bars excluded -- no IV until the model has seed_days of history in each covered block)
+  [PASS] ATM straddle within realistic band     median 1.191% of spot (expect 0.7-1.8%)
+  [PASS] put-call parity holds                  max residual 3.66e-12
+  [PASS] no negative premiums                   min call 72.58, min put 55.81
+  [PASS] all greeks finite                      delta/gamma/vega/theta
+  [PASS] IV within configured clamps            IV range 0.070-0.344
+
+RESULTS
+                              strategy   buy & hold spot
+  total return %                -44.59             50.12
+  sharpe (daily)                 -3.13              0.98
+  max drawdown %                -45.29            -16.96
+  trades                           797                 -
+  win rate %                     35.13                 -
+  avg P&L/trade (Rs)            -1,119                 -
+
+exit=0

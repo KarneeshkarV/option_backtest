@@ -27,17 +27,48 @@ def last_bar_of_day(bars: pd.DataFrame) -> np.ndarray:
     return is_last
 
 
-def shift_signals(mask: pd.Series | np.ndarray) -> np.ndarray:
-    """Delay a signal by one bar.
+def shift_signals(
+    mask: pd.Series | np.ndarray, dates: pd.Series | np.ndarray
+) -> np.ndarray:
+    """Delay a signal by one bar, without crossing a session boundary.
 
     A signal computed from bar ``t``'s close cannot be acted on until bar
     ``t+1``. screener's vbt sweep applies the same shift; without it every
     backtest here would quietly trade on information it did not have.
+
+    The shift is otherwise purely positional, which is wrong at a session
+    boundary: a signal on a session's last row would become an entry on the
+    first row of the next *available* session, which can be months later
+    across one of this dataset's gaps. That is stale intent surviving a gap,
+    not a genuine next-bar fill, so it is dropped whenever the following row's
+    ``date`` differs from the current one.
     """
     values = np.asarray(mask, dtype=bool)
+    dates = np.asarray(dates)
     out = np.zeros_like(values)
-    out[1:] = values[:-1]
+    if len(values) > 1:
+        carried = values[:-1].copy()
+        carried[dates[1:] != dates[:-1]] = False
+        out[1:] = carried
     return out
+
+
+def shift_legs(legs: pd.Series, dates: pd.Series | np.ndarray) -> pd.Series:
+    """Same session-bounded one-bar delay as :func:`shift_signals`, for legs.
+
+    ``legs`` holds ``LegSpec | None`` objects rather than booleans, so "no
+    signal survived the shift" is spelled ``None`` instead of ``False``; it
+    otherwise must move in lockstep with :func:`shift_signals` or the leg
+    lookup in the engine misses every open.
+    """
+    dates = np.asarray(dates)
+    values = legs.to_numpy()
+    out = np.full(len(values), None, dtype=object)
+    if len(values) > 1:
+        carried = values[:-1].copy()
+        carried[dates[1:] != dates[:-1]] = None
+        out[1:] = carried
+    return pd.Series(out, index=legs.index)
 
 
 def resolve_trades(

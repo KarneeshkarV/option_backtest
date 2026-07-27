@@ -1,0 +1,20 @@
+warning: `VIRTUAL_ENV=/root/screneer_main/screener/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead
+SEAM VERIFICATION over 328,875 bars, 877 sessions
+
+1. DATA SOURCE -- csv vs parquet must be indistinguishable
+  [PASS] round-trip: 328,875 bars, frames equal=True
+  [PASS] backtest equality: return -27.6756% via csv, -27.6756% via parquet
+
+2. STRATEGY -- a second plugin runs with no engine changes
+  [PASS] registry: registered: ['buy_open', 'orb']
+         orb        871 trades,   -27.68%
+         buy_open   877 trades,   -45.94%
+  [PASS] independent results: strategies differ
+
+3. VOL MODEL -- swapping it changes premiums, never the schedule
+  [PASS] registry: ['constant', 'gk_vrp']
+  [PASS] trade schedule unchanged: 871 vs 871 trades, same entry/exit timestamps
+  [PASS] premiums changed: median premium Rs68.8 (gk_vrp(vrp=1.31, skew=-1.2, hl=10d)) vs Rs86.1 (constant(iv=0.14))
+
+All seams verified.
+exit=0

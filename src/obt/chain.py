@@ -39,10 +39,18 @@ STRIKE_STEP = 50.0
 #: Black-76 has no such floor: a far-OTM call with one bar of life left prices
 #: to exactly 0.0, which is both untradeable in reality and rejected outright by
 #: vectorbt ("order.price must be finite and greater than 0"). Floor the
-#: tradeable series at one tick. It costs a rupee or two per contract on the
-#: handful of expiry-day bars where it binds, and that error points the
-#: conservative way -- a long that should have died worthless still pays to
-#: close.
+#: tradeable series at one tick.
+#:
+#: **The direction of that error is not symmetric, and it is not conservative
+#: for a long.** A long closes by *selling*: floored, it receives Rs 0.05 for
+#: something truly worth 0, so its P&L is overstated by one tick times
+#: quantity. A short closes by *buying back*, so the same floor costs it the
+#: same amount and understates its P&L. Both shipped strategies are long, so
+#: the bias currently flatters the headline numbers: at a 75-unit lot it is
+#: Rs 3.75 per trade that expires at the floor, which is 156 of the 792 `orb`
+#: trades -- about Rs 585, or 0.03% of starting capital. Small, but it points
+#: the optimistic way for longs, not the conservative way an earlier version
+#: of this comment claimed.
 TICK_SIZE = 0.05
 
 #: Fallback lot size when no point-in-time lot history is available.
