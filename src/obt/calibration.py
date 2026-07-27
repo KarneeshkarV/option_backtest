@@ -34,7 +34,6 @@ anyone reads a number off it:
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,20 +41,16 @@ import numpy as np
 import pandas as pd
 
 from obt.calendar import ExpiryCalendar, tau_years
-from obt.datasource.plugins.nifty_index_csv import read_naive_ist_csv
+from obt.datasource.plugins import nifty_atm_options_csv as _atm_options
 from obt.pricing import black76
 from obt.session import TRADING_DAYS_PER_YEAR
 from obt.vol.base import VolModel
 
-ENV_VAR = "OBT_OPTION_CHAIN_DIR"
-
-#: ``right -> filename``. The vendor also ships a combined
-#: ``NIFTY_ATM_options_1min_*.csv``; it is byte-for-byte ``concat(CE, PE)``, so
-#: reading it as well would double-count every bar.
-CHAIN_FILES = {
-    "call": "NIFTY_ATM_CE_1min_2026-04-22_2026-07-21.csv",
-    "put": "NIFTY_ATM_PE_1min_2026-04-22_2026-07-21.csv",
-}
+# Re-exports so callers keep using obt.calibration.ENV_VAR / CHAIN_FILES.
+CHAIN_FILES = _atm_options.CHAIN_FILES
+ENV_VAR = _atm_options.ENV_VAR
+chain_files_available = _atm_options.chain_files_available
+default_chain_dir = _atm_options.default_chain_dir
 
 #: Bars nearer than this to expiry are excluded from IV inversion. Inside the
 #: last two sessions a near-worthless option's price is dominated by the 5-paise
@@ -71,50 +66,29 @@ ATM_LOG_MONEYNESS = 0.002
 
 
 def chain_dir() -> Path:
-    override = os.environ.get(ENV_VAR)
-    if override:
-        return Path(override).expanduser()
-    return Path(__file__).resolve().parents[2]
+    """Directory holding the observed CE/PE CSVs.
+
+    Override with ``$OBT_OPTION_CHAIN_DIR``.
+    """
+    return default_chain_dir()
 
 
 def chain_available() -> bool:
     """Whether the observed-quote files are present on this machine."""
-    directory = chain_dir()
-    return all((directory / name).exists() for name in CHAIN_FILES.values())
+    return chain_files_available(chain_dir())
 
 
 def load_observed_chain(directory: Path | None = None) -> pd.DataFrame:
     """Observed CE and PE quotes, one row per bar per right.
 
-    Returns columns ``right, strike, expiry, premium`` on a tz-aware IST index,
-    with ``right`` values matching :mod:`obt.pricing.black76`.
+    Thin wrapper over the ``nifty_atm_options_csv`` option-source plugin so
+    calibration and the engine share one reader. Returns columns
+    ``right, strike, expiry, premium`` on a tz-aware IST index, with ``right``
+    values matching :mod:`obt.pricing.black76`.
     """
-    directory = directory or chain_dir()
-    frames = []
-    for right, filename in CHAIN_FILES.items():
-        path = directory / filename
-        if not path.exists():
-            raise FileNotFoundError(
-                f"observed chain file not found at {path}. "
-                f"Set ${ENV_VAR} to the directory holding them."
-            )
-        raw = read_naive_ist_csv(path)
-        frames.append(
-            pd.DataFrame(
-                {
-                    "right": right,
-                    "strike": raw["strike"].astype("float64").to_numpy(),
-                    "expiry": pd.to_datetime(raw["expiry"]).dt.date.to_numpy(),
-                    "premium": raw["close"].astype("float64").to_numpy(),
-                },
-                index=pd.DatetimeIndex(raw["datetime"], name="datetime"),
-            )
-        )
-    # `read_naive_ist_csv` has already localized the timestamps to IST, which
-    # matters: these bars are matched against spot by exact timestamp, so a
-    # missing offset would shift every one of them by 5h30m and silently align
-    # each quote with the wrong bar.
-    return pd.concat(frames).sort_index()
+    from obt.datasource import get_option_source
+
+    return get_option_source("nifty_atm_options_csv", path=directory).load("NIFTY")
 
 
 def _align(

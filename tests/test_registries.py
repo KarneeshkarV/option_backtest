@@ -64,8 +64,9 @@ def test_unknown_name_lists_the_known_ones(module, package):
 
 
 def test_reference_plugins_are_registered():
-    assert {"orb", "buy_open"} <= set(strategies.strategy_names())
+    assert {"orb", "buy_open", "ema_cross"} <= set(strategies.strategy_names())
     assert {"nifty_csv", "parquet_spot"} <= set(datasource.source_names())
+    assert {"nifty_atm_options_csv"} <= set(datasource.option_source_names())
     assert {"gk_vrp", "constant"} <= set(vol.vol_model_names())
 
 

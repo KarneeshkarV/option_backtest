@@ -28,8 +28,15 @@ import pandas as pd
 import vectorbt as vbt
 
 from obt.calendar import ExpiryCalendar, block_edge_sessions
-from obt.chain import LegSpec, lot_size_for, pinned_leg
+from obt.chain import (
+    LegSpec,
+    lot_size_for,
+    pinned_leg,
+    pinned_leg_from_observed_chain,
+)
 from obt.costs import IndiaOptionsCosts, SlippageParams, vbt_fees
+from obt.datasource.base import OptionChainSource
+from obt.datasource.spec import get_option_source
 from obt.session import TRADING_DAYS_PER_YEAR
 from obt.signals import last_bar_of_day, resolve_trades, shift_legs, shift_signals
 from obt.strategies.spec import get_strategy
@@ -150,23 +157,70 @@ def _extract_trades(portfolio: vbt.Portfolio, bars: pd.DataFrame) -> pd.DataFram
     return out
 
 
+def _resolve_option_chain(
+    option_source: str | OptionChainSource | pd.DataFrame | None,
+    bars: pd.DataFrame,
+) -> tuple[pd.DataFrame | None, str | None]:
+    """Load/normalize an observed chain, restricted to ``bars`` timestamps.
+
+    Returns ``(chain_or_None, source_label)``. ``None`` means price with the
+    synthetic Black-76 path.
+    """
+    if option_source is None:
+        return None, None
+    if isinstance(option_source, str):
+        label = option_source
+        chain = get_option_source(option_source).load("NIFTY")
+    elif isinstance(option_source, pd.DataFrame):
+        label = "inline_option_chain"
+        chain = option_source
+    else:
+        label = type(option_source).__name__
+        chain = option_source.load("NIFTY")
+
+    # Only quotes that line up with a spot bar can fill. Keep the full chain
+    # columns; reindex happens per-leg inside pinned_leg_from_observed_chain.
+    shared = chain.index.intersection(bars.index)
+    if shared.empty:
+        raise ValueError(
+            "observed option chain and spot bars do not overlap. Chain covers "
+            f"{chain.index.min()}..{chain.index.max()}; bars cover "
+            f"{bars.index.min()}..{bars.index.max()}."
+        )
+    return chain.loc[shared], label
+
+
 def run(
     bars: pd.DataFrame,
     strategy_name: str,
     *,
     vol: VolModel | str = "gk_vrp",
     vol_kwargs: dict[str, Any] | None = None,
+    option_source: str | OptionChainSource | pd.DataFrame | None = None,
     costs: IndiaOptionsCosts | None = None,
     slippage: SlippageParams | None = None,
     init_cash: float = DEFAULT_INIT_CASH,
     params: dict[str, Any] | None = None,
     calendar_time: bool = False,
 ) -> BacktestResult:
-    """Run ``strategy_name`` over ``bars`` and return a judged result."""
+    """Run ``strategy_name`` over ``bars`` and return a judged result.
+
+    Pass ``option_source`` (registry name, :class:`OptionChainSource`, or a
+    pre-loaded chain frame) to price fills from **observed** option quotes
+    instead of Black-76. Spot bars still drive signals; only the premium path
+    switches.
+    """
     spec = get_strategy(strategy_name)
-    vol_model = (
-        get_vol_model(vol, **(vol_kwargs or {})) if isinstance(vol, str) else vol
-    )
+    observed_chain, option_source_label = _resolve_option_chain(option_source, bars)
+    use_observed = observed_chain is not None
+
+    # Vol model is only required for the synthetic pricing path. Observed
+    # premiums do not need IV warmup (or a vol model at all).
+    vol_model: VolModel | None = None
+    if not use_observed:
+        vol_model = (
+            get_vol_model(vol, **(vol_kwargs or {})) if isinstance(vol, str) else vol
+        )
     costs = costs or IndiaOptionsCosts()
     slippage = slippage or SlippageParams()
     calendar = ExpiryCalendar.from_bars(bars)
@@ -186,14 +240,24 @@ def run(
         shift_legs(signals.legs, bars["date"]) if signals.legs is not None else None
     )
 
-    # The vol model emits no IV until it is warm -- it requires `seed_days` of
-    # history within the current covered block rather than backfilling from the
-    # future. An option priced off a NaN IV is not a tradeable bar, so entry
-    # intent is dropped there. Without this, vectorbt silently ignores the
-    # resulting NaN-priced orders and the shortfall resurfaces below as a bogus
-    # "cash ran out" censoring warning, which is a misdiagnosis.
-    warm = np.isfinite(vol_model.atm_iv(bars).to_numpy())
-    entries = entries & warm
+    # Tradeable-bar filter: synthetic path needs a warm vol model; observed
+    # path needs a finite premium quote on the fill bar for at least one right
+    # (the per-leg path drops opens that lack that right's quote).
+    if use_observed:
+        assert observed_chain is not None
+        quote_times = observed_chain.index.unique()
+        warm = bars.index.isin(quote_times)
+        entries = entries & warm
+    else:
+        assert vol_model is not None
+        # The vol model emits no IV until it is warm -- it requires `seed_days`
+        # of history within the current covered block rather than backfilling
+        # from the future. An option priced off a NaN IV is not a tradeable
+        # bar, so entry intent is dropped there. Without this, vectorbt
+        # silently ignores the resulting NaN-priced orders and the shortfall
+        # resurfaces below as a bogus "cash ran out" censoring warning.
+        warm = np.isfinite(vol_model.atm_iv(bars).to_numpy())
+        entries = entries & warm
 
     # Guarantee 2 + 3: resolve to real positions with a forced end-of-day exit.
     is_last = last_bar_of_day(bars)
@@ -215,9 +279,27 @@ def run(
     used_names: dict[str, int] = {}
 
     for leg, leg_open in groups:
-        priced = pinned_leg(
-            bars, leg_open, leg, vol_model, calendar, calendar_time=calendar_time
-        )
+        if use_observed:
+            assert observed_chain is not None
+            # Drop opens where this right has no quote on the fill bar.
+            right_ok = observed_chain.loc[observed_chain["right"] == leg.right]
+            has_quote = bars.index.isin(right_ok.index.unique())
+            leg_open = leg_open & has_quote
+            if not leg_open.any():
+                continue
+            priced = pinned_leg_from_observed_chain(
+                bars,
+                leg_open,
+                leg,
+                observed_chain,
+                calendar,
+                calendar_time=calendar_time,
+            )
+        else:
+            assert vol_model is not None
+            priced = pinned_leg(
+                bars, leg_open, leg, vol_model, calendar, calendar_time=calendar_time
+            )
         # Close only the trades this leg actually opened.
         leg_close = close_mask & _closes_for_opens(leg_open, open_mask, close_mask)
         # `leg.label` collides whenever two distinct LegSpecs describe the same
@@ -233,6 +315,17 @@ def run(
         exit_columns[name] = leg_close
         leg_frames[name] = priced
         column_legs.append(leg)
+
+    if not column_legs:
+        raise ValueError(
+            f"strategy {strategy_name!r} produced no trades with tradeable premiums"
+        )
+
+    # Rebuild open_mask from the legs we actually kept (some opens may have
+    # been dropped for missing per-right quotes on the observed path).
+    open_mask = np.zeros(len(bars), dtype=bool)
+    for leg_open in entry_columns.values():
+        open_mask |= np.asarray(leg_open, dtype=bool)
 
     close = pd.DataFrame(premium_columns, index=bars.index)
     entry_df = pd.DataFrame(entry_columns, index=bars.index)
@@ -275,18 +368,32 @@ def run(
 
     trades = _extract_trades(portfolio, bars)
 
-    warnings: list[str] = [
-        "Premiums are Black-76 model output, not observed quotes. "
-        "Every P&L number inherits the vol model's assumptions."
-    ]
+    if use_observed:
+        warnings = [
+            f"Premiums are OBSERVED quotes from option source "
+            f"{option_source_label!r} -- not Black-76 model output."
+        ]
+    else:
+        warnings = [
+            "Premiums are Black-76 model output, not observed quotes. "
+            "Every P&L number inherits the vol model's assumptions."
+        ]
 
-    unwarmed_sessions = int(bars.loc[~warm, "date"].nunique())
-    if unwarmed_sessions:
-        warnings.append(
-            f"{unwarmed_sessions} of {bars['date'].nunique()} sessions carry no "
-            "vol-model IV yet -- the model re-warms after every data gap -- and "
-            "were excluded from trading rather than priced off a backfilled IV."
-        )
+    if not use_observed:
+        unwarmed_sessions = int(bars.loc[~warm, "date"].nunique())
+        if unwarmed_sessions:
+            warnings.append(
+                f"{unwarmed_sessions} of {bars['date'].nunique()} sessions carry no "
+                "vol-model IV yet -- the model re-warms after every data gap -- and "
+                "were excluded from trading rather than priced off a backfilled IV."
+            )
+    else:
+        unquoted_sessions = int(bars.loc[~warm, "date"].nunique())
+        if unquoted_sessions:
+            warnings.append(
+                f"{unquoted_sessions} of {bars['date'].nunique()} sessions have no "
+                "observed option quote and were excluded from trading."
+            )
 
     # A losing run can spend the account partway through the sample, after
     # which vectorbt rejects orders for want of cash. The backtest still
@@ -302,21 +409,21 @@ def run(
             f"data ends {bars['date'].iloc[-1]}). Raise init_cash and re-run "
             "before reading any of these statistics."
         )
-    # The calendar reads holidays off data presence, which misfires at the last
-    # session of each covered block: no bars follow, so it looks like a holiday
-    # run and the expiry rolls back onto the block edge. Trades there are priced
-    # against a contract that expires sooner than the real one did.
-    edge_sessions = set(block_edge_sessions(bars, calendar))
-    if edge_sessions and executed:
-        affected = int(trades["entry_date"].isin(edge_sessions).sum())
-        if affected:
-            warnings.append(
-                f"{affected} of {executed} trades sit on the trailing edge of a "
-                f"data block ({len(edge_sessions)} such sessions), where the "
-                "expiry rolls back only because the data stops rather than "
-                "because the exchange was shut. Their options are priced too "
-                "cheap by a shortened time to expiry."
-            )
+    # Edge-session underpricing only applies to the synthetic path, where
+    # expiry is inferred from the calendar. Observed quotes already embed the
+    # real contract's time value.
+    if not use_observed:
+        edge_sessions = set(block_edge_sessions(bars, calendar))
+        if edge_sessions and executed:
+            affected = int(trades["entry_date"].isin(edge_sessions).sum())
+            if affected:
+                warnings.append(
+                    f"{affected} of {executed} trades sit on the trailing edge of a "
+                    f"data block ({len(edge_sessions)} such sessions), where the "
+                    "expiry rolls back only because the data stops rather than "
+                    "because the exchange was shut. Their options are priced too "
+                    "cheap by a shortened time to expiry."
+                )
 
     if not lot_from_history:
         # Report the flat lot size(s) actually used per leg (usually one
@@ -350,7 +457,11 @@ def run(
     assumptions = {
         "strategy": strategy_name,
         "params": merged,
-        "vol_model": vol_model.label,
+        "vol_model": (
+            "n/a (observed premiums)" if use_observed else vol_model.label  # type: ignore[union-attr]
+        ),
+        "option_source": option_source_label,
+        "premiums": "observed" if use_observed else "black76",
         "slippage_pct": slippage.premium_pct * 100.0,
         "fee_fraction": vbt_fees(costs),
         "stt_rate": costs.stt_rate,

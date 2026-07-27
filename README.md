@@ -48,7 +48,18 @@ grid is 16 full backtests, so `--no-sensitivity` is the fast path.
 | `NIFTY_1MIN_5YEAR (1).csv` | Index spot 1-min OHLC | 2021-06-17 → 2026-06-15, 891 days |
 | `NIFTY_index_1min_2026-*.csv` | Index spot, second vendor | 2026-04-22 → 2026-07-21, 62 days |
 | `NIFTY_ATM_{CE,PE}_1min_2026-*.csv` | **Real** ATM option quotes | 2026-04-22 → 2026-07-21, 60 days |
-| `NIFTY_ATM_options_1min_2026-*.csv` | Byte-for-byte `concat(CE, PE)` — unused | — |
+| `NIFTY_ATM_options_1min_2026-*.csv` | `concat(CE, PE)` (same rows, often reordered) — do not load alongside CE/PE | — |
+
+**Observed-premium backtests.** By default premiums are still Black-76. To price
+fills from the CE/PE CSVs instead:
+
+```bash
+just run-orb-observed          # ORB on traded quotes (2026 index spot + ATM options)
+just run-canary-observed       # buy_open canary on the same path
+```
+
+Or in code: `engine.run(bars, "orb", option_source="nifty_atm_options_csv")`.
+Spot should come from `nifty_index_csv` so timestamps align with the option window.
 
 Cleaning keeps only complete 375-bar sessions (09:15–15:29), leaving 877 days
 and 328,875 bars. Dropped: ~14 partial days, and 181 after-hours bars on three

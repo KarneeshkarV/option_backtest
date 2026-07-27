@@ -76,6 +76,7 @@ def discover_plugins() -> None:
     """Import every plugin module so its ``@strategy`` decorator fires."""
     from obt.strategies.plugins import (  # noqa: F401
         buy_open,
+        ema_cross,
         orb,
     )
 

@@ -59,24 +59,39 @@ def _calibration_note() -> str:
 def format_banner(result: BacktestResult, bars: pd.DataFrame) -> str:
     a = result.assumptions
     periods = covered_periods(bars)
+    observed = a.get("premiums") == "observed"
+    title = (
+        "OBSERVED OPTION BACKTEST -- premiums from traded quotes"
+        if observed
+        else "SYNTHETIC OPTION BACKTEST -- premiums are modelled, not observed"
+    )
     lines = [
         "=" * 78,
-        "SYNTHETIC OPTION BACKTEST -- premiums are modelled, not observed",
+        title,
         "=" * 78,
         f"strategy       : {a['strategy']}  {a['params']}",
-        f"vol model      : {a['vol_model']}",
-        f"calibration    : {_calibration_note()}",
-        f"slippage       : {a['slippage_pct']:.3f}% of premium per fill",
-        f"statutory fees : {a['fee_fraction'] * 100:.4f}% per fill "
-        f"(STT {a['stt_rate'] * 100:.4f}% sell-side)",
-        f"time basis     : {a['time_basis']} time to expiry",
-        f"size           : {a['quantity_per_trade']} units/trade "
-        f"(lot from history: {a['lot_from_history']})",
-        f"capital        : Rs {a['init_cash']:,.0f}",
-        "",
-        f"sample         : {len(bars):,} bars over "
-        f"{len({*bars['date']}):,} trading days, in {len(periods)} blocks",
+        f"premiums       : {a.get('premiums', 'black76')}",
     ]
+    if observed:
+        lines.append(f"option source  : {a.get('option_source')}")
+        lines.append("vol model      : n/a (not used when premiums are observed)")
+    else:
+        lines.append(f"vol model      : {a['vol_model']}")
+        lines.append(f"calibration    : {_calibration_note()}")
+    lines.extend(
+        [
+            f"slippage       : {a['slippage_pct']:.3f}% of premium per fill",
+            f"statutory fees : {a['fee_fraction'] * 100:.4f}% per fill "
+            f"(STT {a['stt_rate'] * 100:.4f}% sell-side)",
+            f"time basis     : {a['time_basis']} time to expiry",
+            f"size           : {a['quantity_per_trade']} units/trade "
+            f"(lot from history: {a['lot_from_history']})",
+            f"capital        : Rs {a['init_cash']:,.0f}",
+            "",
+            f"sample         : {len(bars):,} bars over "
+            f"{len({*bars['date']}):,} trading days, in {len(periods)} blocks",
+        ]
+    )
     for start, end in periods:
         lines.append(f"                 {start} -> {end}")
     lines.append("")

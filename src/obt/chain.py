@@ -1,19 +1,22 @@
-"""Synthetic option series: strike selection, expiry pinning, premium paths.
+"""Option series: strike selection, expiry pinning, premium paths.
 
 This module is where spot becomes an option, and it is the single most
 dangerous file in the package. The danger has one shape: **a premium series
 whose strike moves while a position is open is meaningless**, and it looks
-completely plausible in a chart. Two functions exist to keep that distinction
-impossible to blur by accident:
+completely plausible in a chart. Two synthetic helpers and one observed path
+keep that distinction impossible to blur by accident:
 
 - :func:`rolling_atm` re-picks the strike every bar. Use it to *study* how
   premiums behave. It is not tradeable and must never reach a portfolio.
-- :func:`pinned_leg` freezes strike and expiry at the bar a position opens and
-  holds them until it closes. **This is the only series valid for P&L.**
+- :func:`pinned_leg` freezes strike and expiry at the open and prices with
+  Black-76. **Valid for P&L only as a model**, not as market truth.
+- :func:`pinned_leg_from_observed_chain` freezes strike and expiry the same
+  way, but reads **observed** premiums from an :class:`OptionChainSource`.
+  This is the path that matches ``screener``'s rule: P&L uses traded quotes.
 
-When the real option chain eventually arrives, :func:`pinned_leg` is the one
-function to replace; everything downstream consumes its output shape and does
-not care that today the prices are modelled.
+Everything downstream consumes the same output shape
+(``premium/strike/iv/tau/expiry``), so the engine does not care which path
+produced the frame.
 """
 
 from __future__ import annotations
@@ -259,6 +262,111 @@ def pinned_leg(
     premium = np.maximum(
         black76.price(spot, strike, tau, iv, leg.right, rate=rate), TICK_SIZE
     )
+
+    return pd.DataFrame(
+        {
+            "premium": premium,
+            "strike": strike,
+            "iv": iv,
+            "tau": tau,
+            "expiry": expiry.to_numpy(),
+        },
+        index=bars.index,
+    )
+
+
+def pinned_leg_from_observed_chain(
+    bars: pd.DataFrame,
+    open_mask: np.ndarray,
+    leg: LegSpec,
+    chain: pd.DataFrame,
+    calendar: ExpiryCalendar,
+    *,
+    calendar_time: bool = False,
+) -> pd.DataFrame:
+    """Premium path from **observed** quotes, strike/expiry frozen at each open.
+
+    Same pinning contract as :func:`pinned_leg`, but premiums come from
+    ``chain`` (columns ``right, strike, expiry, premium`` on a tz-aware IST
+    index -- see :func:`obt.datasource.normalize_option_chain`) rather than
+    Black-76. IV is left as NaN: the quote is the price; we do not invert it
+    on the hot path.
+
+    The shipped ATM CSVs carry one strike per weekly cycle. Non-``atm``
+    ``strike_rule`` values are therefore rejected here: there is no OTM/ITM
+    ladder in the file to look up. When a fuller chain arrives, extend the
+    lookup; do not silently fall back to the model.
+    """
+    if leg.strike_rule.strip().lower() != "atm":
+        raise ValueError(
+            f"observed option chain only supports strike_rule='atm' "
+            f"(got {leg.strike_rule!r}); the CE/PE files carry one ATM strike "
+            "per weekly cycle, not an OTM/ITM ladder"
+        )
+
+    open_mask = np.asarray(open_mask, dtype=bool)
+    right_chain = chain.loc[chain["right"] == leg.right]
+    if right_chain.empty:
+        raise ValueError(f"observed option chain has no rows for right={leg.right!r}")
+
+    # One quote per timestamp for this right. Duplicate stamps would mean the
+    # feed grew a multi-strike chain without this function learning to pick.
+    if right_chain.index.has_duplicates:
+        counts = right_chain.index.value_counts()
+        bad = counts[counts > 1]
+        raise ValueError(
+            f"observed chain has multiple {leg.right} quotes at the same "
+            f"timestamp (e.g. {bad.index[0]}); pinned_leg_from_observed_chain "
+            "expects one ATM row per right per bar"
+        )
+
+    # Align quotes onto the spot index. Some sessions have fewer option bars
+    # than spot bars; fill gaps only within the same session so a missing
+    # minute does not borrow yesterday's premium across the overnight gap.
+    by_day = bars["date"]
+    strike_series = (
+        right_chain["strike"]
+        .reindex(bars.index)
+        .groupby(by_day)
+        .ffill()
+        .groupby(by_day)
+        .bfill()
+    )
+    expiry_series_ = (
+        right_chain["expiry"]
+        .reindex(bars.index)
+        .groupby(by_day)
+        .ffill()
+        .groupby(by_day)
+        .bfill()
+    )
+    premium_series = (
+        right_chain["premium"]
+        .reindex(bars.index)
+        .groupby(by_day)
+        .ffill()
+        .groupby(by_day)
+        .bfill()
+    )
+
+    # Pin at resolved opens, then carry forward -- same ffill pattern as the
+    # synthetic path. Premium follows the *pinned* contract: with one ATM row
+    # per right the reindexed series already is that contract within a cycle,
+    # and EOD force-exit keeps every trade inside a single session.
+    strike_at_open = strike_series.where(open_mask)
+    strike = strike_at_open.ffill().bfill().to_numpy(dtype="float64")
+
+    expiry_at_open = expiry_series_.where(open_mask)
+    expiry = expiry_at_open.ffill().bfill()
+
+    premium = premium_series.to_numpy(dtype="float64")
+    # Same tick floor as the synthetic path: vectorbt rejects a non-positive
+    # price. Real quotes already sit on the 5-paise grid; this only clamps
+    # the rare exact-zero print.
+    premium = np.where(np.isfinite(premium), np.maximum(premium, TICK_SIZE), premium)
+
+    tau = tau_years(bars, expiry, calendar, calendar_time=calendar_time)
+    iv = np.full(len(bars), np.nan, dtype="float64")
 
     return pd.DataFrame(
         {
